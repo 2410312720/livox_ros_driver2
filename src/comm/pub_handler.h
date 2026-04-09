@@ -26,6 +26,7 @@
 #define LIVOX_DRIVER_PUB_HANDLER_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <condition_variable> // std::condition_variable
 #include <deque>
@@ -49,6 +50,7 @@ class LidarPubHandler {
   void PointCloudProcess(RawPacket& pkt);
   void SetLidarsExtParam(LidarExtParameter param);
   void GetLidarPointClouds(std::vector<PointXyzlt>& points_clouds);
+  void Reset();
 
   uint64_t GetRecentTimeStamp();
   uint32_t GetLidarPointCloudsSize();
@@ -76,9 +78,10 @@ class PubHandler {
  public:
   using PointCloudsCallback = std::function<void(PointFrame*, void *)>;
   using ImuDataCallback = std::function<void(ImuData*, void*)>;
-  using TimePoint = std::chrono::high_resolution_clock::time_point;
+  using PublishClock = std::chrono::steady_clock;
+  using TimePoint = PublishClock::time_point;
 
-  PubHandler() {}
+  PubHandler();
 
   ~ PubHandler() { Uninit(); }
 
@@ -106,7 +109,13 @@ class PubHandler {
                                              LivoxLidarEthernetPacket *data, void *client_data);
   
   static bool GetLidarId(LidarProtoType lidar_type, uint32_t handle, uint32_t& id);
-  static uint64_t GetEthPacketTimestamp(uint8_t timestamp_type, uint8_t* time_stamp, uint8_t size);
+  uint64_t GetEthPacketTimestamp(uint8_t timestamp_type, uint8_t* time_stamp, uint8_t size,
+                                 bool* clock_jump_detected = nullptr);
+  uint64_t GetNoSyncTimestamp(bool* clock_jump_detected);
+  void ScheduleTimeDomainReset(const char* reason);
+  void HandlePendingTimeDomainReset();
+  void ResetBufferedData();
+  int64_t GetNoSyncClockJumpToleranceNs() const;
 
   PointCloudsCallback points_callback_;
   void* pub_client_data_ = nullptr;
@@ -128,7 +137,15 @@ class PubHandler {
   std::map<uint32_t, std::vector<PointXyzlt>> points_;
   std::map<uint32_t, LidarExtParameter> lidar_extrinsics_;
   static std::atomic<bool> is_timestamp_sync_;
+  std::atomic<bool> has_seen_timestamp_sync_state_{false};
+  std::atomic<bool> pending_time_domain_reset_{false};
   uint16_t lidar_listen_id_ = 0;
+
+  std::mutex no_sync_time_mutex_;
+  TimePoint no_sync_steady_anchor_;
+  int64_t no_sync_system_anchor_ns_ = 0;
+  bool no_sync_time_initialized_ = false;
+  bool last_pub_time_initialized_ = false;
 };
 
 PubHandler &pub_handler();

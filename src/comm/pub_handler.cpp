@@ -24,12 +24,15 @@
 
 #include "pub_handler.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <chrono>
 #include <iostream>
 #include <limits>
 
 namespace livox_ros {
+
+PubHandler::PubHandler() {}
 
 std::atomic<bool> PubHandler::is_timestamp_sync_;
 
@@ -102,20 +105,29 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
     return;
   }
 
-  if (data->time_type != kTimestampTypeNoSync) {
-    is_timestamp_sync_.store(true);
-  } else {
-    is_timestamp_sync_.store(false);
+  const bool timestamp_sync = (data->time_type != kTimestampTypeNoSync);
+  const bool previous_timestamp_sync = is_timestamp_sync_.exchange(timestamp_sync);
+  bool time_domain_changed = false;
+  if (self->has_seen_timestamp_sync_state_.exchange(true) &&
+      previous_timestamp_sync != timestamp_sync) {
+    self->ScheduleTimeDomainReset("Timestamp sync mode changed. Resetting buffered data.");
+    time_domain_changed = true;
   }
 
   if (data->data_type == kLivoxLidarImuData) {
     if (self->imu_callback_) {
       RawImuPoint* imu = (RawImuPoint*) data->data;
+      bool clock_jump_detected = false;
       ImuData imu_data;
       imu_data.lidar_type = static_cast<uint8_t>(LidarProtoType::kLivoxLidarType);
       imu_data.handle = handle;
-      imu_data.time_stamp = GetEthPacketTimestamp(data->time_type,
-                                                  data->timestamp, sizeof(data->timestamp));
+      imu_data.time_stamp = self->GetEthPacketTimestamp(data->time_type,
+                                                        data->timestamp,
+                                                        sizeof(data->timestamp),
+                                                        &clock_jump_detected);
+      if (time_domain_changed || clock_jump_detected) {
+        return;
+      }
       imu_data.gyro_x = imu->gyro_x;
       imu_data.gyro_y = imu->gyro_y;
       imu_data.gyro_z = imu->gyro_z;
@@ -140,8 +152,14 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
   packet.data_type = data->data_type;
   packet.point_num = data->dot_num;
   packet.point_interval = data->time_interval * 100 / data->dot_num;  //ns
-  packet.time_stamp = GetEthPacketTimestamp(data->time_type,
-                                            data->timestamp, sizeof(data->timestamp));
+  bool clock_jump_detected = false;
+  packet.time_stamp = self->GetEthPacketTimestamp(data->time_type,
+                                                  data->timestamp,
+                                                  sizeof(data->timestamp),
+                                                  &clock_jump_detected);
+  if (time_domain_changed || clock_jump_detected) {
+    return;
+  }
   uint32_t length = data->length - sizeof(LivoxLidarEthernetPacket) + 1;
   packet.raw_data.insert(packet.raw_data.end(), data->data, data->data + length);
   {
@@ -162,7 +180,6 @@ void PubHandler::PublishPointCloud() {
 }
 
 void PubHandler::CheckTimer(uint32_t id) {
-
   if (PubHandler::is_timestamp_sync_.load()) { // Enable time synchronization
     auto& process_handler = lidar_process_handlers_[id];
     uint64_t recent_time_ms = process_handler->GetRecentTimeStamp() / kRatioOfMsToNs;
@@ -193,18 +210,20 @@ void PubHandler::CheckTimer(uint32_t id) {
       frame_.lidar_num = 0;
     }
   } else { // Disable time synchronization
-    auto now_time = std::chrono::high_resolution_clock::now();
-    //First Set
-    static bool first = true;
-    if (first) {
+    auto now_time = PublishClock::now();
+    if (!last_pub_time_initialized_) {
       last_pub_time_ = now_time;
-      first = false;
+      last_pub_time_initialized_ = true;
       return;
     }
-    if (now_time - last_pub_time_ < std::chrono::nanoseconds(publish_interval_)) {
+    const auto publish_interval = std::chrono::nanoseconds(publish_interval_);
+    if (now_time - last_pub_time_ < publish_interval) {
       return;
     }
-    last_pub_time_ += std::chrono::nanoseconds(publish_interval_);
+    last_pub_time_ += publish_interval;
+    if (now_time - last_pub_time_ > publish_interval) {
+      last_pub_time_ = now_time;
+    }
     for (auto &process_handler : lidar_process_handlers_) {
       frame_.base_time[frame_.lidar_num] = process_handler.second->GetLidarBaseTime();
       uint32_t handle = process_handler.first;
@@ -229,6 +248,7 @@ void PubHandler::CheckTimer(uint32_t id) {
 void PubHandler::RawDataProcess() {
   RawPacket raw_data;
   while (!is_quit_.load()) {
+    HandlePendingTimeDomainReset();
     {
       std::unique_lock<std::mutex> lock(packet_mutex_);
       if (raw_packet_queue_.empty()) {
@@ -262,16 +282,103 @@ bool PubHandler::GetLidarId(LidarProtoType lidar_type, uint32_t handle, uint32_t
   return false;
 }
 
-uint64_t PubHandler::GetEthPacketTimestamp(uint8_t timestamp_type, uint8_t* time_stamp, uint8_t size) {
+uint64_t PubHandler::GetEthPacketTimestamp(uint8_t timestamp_type, uint8_t* time_stamp, uint8_t size,
+                                           bool* clock_jump_detected) {
   LdsStamp time;
   memcpy(time.stamp_bytes, time_stamp, size);
 
   if (timestamp_type == kTimestampTypeGptpOrPtp ||
       timestamp_type == kTimestampTypeGps) {
+    if (clock_jump_detected) {
+      *clock_jump_detected = false;
+    }
     return time.stamp;
   }
 
-  return std::chrono::high_resolution_clock::now().time_since_epoch().count();
+  return GetNoSyncTimestamp(clock_jump_detected);
+}
+
+uint64_t PubHandler::GetNoSyncTimestamp(bool* clock_jump_detected) {
+  const auto steady_now = PublishClock::now();
+  const int64_t system_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+  bool local_clock_jump_detected = false;
+  int64_t timestamp_ns = system_now_ns;
+
+  {
+    std::lock_guard<std::mutex> lock(no_sync_time_mutex_);
+    if (!no_sync_time_initialized_) {
+      no_sync_steady_anchor_ = steady_now;
+      no_sync_system_anchor_ns_ = system_now_ns;
+      no_sync_time_initialized_ = true;
+    } else {
+      const int64_t steady_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          steady_now - no_sync_steady_anchor_).count();
+      const int64_t projected_system_now_ns = no_sync_system_anchor_ns_ + steady_elapsed_ns;
+      const int64_t delta_ns = system_now_ns - projected_system_now_ns;
+
+      if (std::llabs(delta_ns) > GetNoSyncClockJumpToleranceNs()) {
+        local_clock_jump_detected = true;
+        no_sync_steady_anchor_ = steady_now;
+        no_sync_system_anchor_ns_ = system_now_ns;
+      }
+    }
+
+    const int64_t steady_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        steady_now - no_sync_steady_anchor_).count();
+    timestamp_ns = no_sync_system_anchor_ns_ + steady_elapsed_ns;
+  }
+
+  if (clock_jump_detected) {
+    *clock_jump_detected = local_clock_jump_detected;
+  }
+
+  if (local_clock_jump_detected) {
+    ScheduleTimeDomainReset("Detected a system clock jump in no-sync mode. Resetting buffered data.");
+  }
+
+  return static_cast<uint64_t>(timestamp_ns);
+}
+
+void PubHandler::ScheduleTimeDomainReset(const char* reason) {
+  bool expected = false;
+  if (!pending_time_domain_reset_.compare_exchange_strong(expected, true)) {
+    return;
+  }
+
+  std::cerr << reason << std::endl;
+  {
+    std::lock_guard<std::mutex> lock(packet_mutex_);
+    raw_packet_queue_.clear();
+  }
+  packet_condition_.notify_one();
+}
+
+void PubHandler::HandlePendingTimeDomainReset() {
+  if (!pending_time_domain_reset_.exchange(false)) {
+    return;
+  }
+
+  ResetBufferedData();
+  last_pub_time_initialized_ = false;
+}
+
+void PubHandler::ResetBufferedData() {
+  {
+    std::lock_guard<std::mutex> lock(packet_mutex_);
+    raw_packet_queue_.clear();
+  }
+
+  frame_ = {};
+  points_.clear();
+  for (auto& process_handler : lidar_process_handlers_) {
+    process_handler.second->Reset();
+  }
+}
+
+int64_t PubHandler::GetNoSyncClockJumpToleranceNs() const {
+  return static_cast<int64_t>(std::max<uint64_t>(publish_interval_ * 5, kNsPerSecond));
 }
 
 /*******************************/
@@ -279,6 +386,7 @@ uint64_t PubHandler::GetEthPacketTimestamp(uint8_t timestamp_type, uint8_t* time
 LidarPubHandler::LidarPubHandler() : is_set_extrinsic_params_(false) {}
 
 uint64_t LidarPubHandler::GetLidarBaseTime() {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (points_clouds_.empty()) {
     return 0;
   }
@@ -291,6 +399,7 @@ void LidarPubHandler::GetLidarPointClouds(std::vector<PointXyzlt>& points_clouds
 }
 
 uint64_t LidarPubHandler::GetRecentTimeStamp() {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (points_clouds_.empty()) {
     return 0;
   }
@@ -300,6 +409,11 @@ uint64_t LidarPubHandler::GetRecentTimeStamp() {
 uint32_t LidarPubHandler::GetLidarPointCloudsSize() {
   std::lock_guard<std::mutex> lock(mutex_);
   return points_clouds_.size();
+}
+
+void LidarPubHandler::Reset() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  points_clouds_.clear();
 }
 
 //convert to standard format and extrinsic compensate
