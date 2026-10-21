@@ -38,8 +38,8 @@ add_definitions(-DBUILDING_ROS2)
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common)
 ament_auto_find_build_dependencies()
-find_package(PCL REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
@@ -61,13 +61,32 @@ rosidl_generate_interfaces(${LIVOX_INTERFACES}
   LIBRARY_NAME ${PROJECT_NAME}
 )
 
-## make sure the livox_lidar_sdk_shared library is installed
-find_library(LIVOX_LIDAR_SDK_LIBRARY liblivox_lidar_sdk_shared.so /usr/local/lib REQUIRED)
+## Locate the target Livox SDK inside the selected sysroot.  Do not search the
+## laptop's /usr/local because that can select an x86_64 library.
+if(NOT DEFINED LIVOX_SDK_ROOT)
+  if(CMAKE_SYSROOT)
+    set(LIVOX_SDK_ROOT "${CMAKE_SYSROOT}/usr/local")
+  else()
+    set(LIVOX_SDK_ROOT "/usr/local")
+  endif()
+endif()
+
+find_library(LIVOX_LIDAR_SDK_LIBRARY
+  NAMES livox_lidar_sdk_shared
+  PATHS "${LIVOX_SDK_ROOT}/lib"
+  NO_DEFAULT_PATH
+  REQUIRED)
 
 ##
 find_path(LIVOX_LIDAR_SDK_INCLUDE_DIR
-  NAMES "livox_lidar_api.h" "livox_lidar_def.h"
+  NAMES livox_lidar_api.h livox_lidar_def.h
+  PATHS "${LIVOX_SDK_ROOT}/include"
+  NO_DEFAULT_PATH
   REQUIRED)
+
+message(STATUS "Livox SDK root: ${LIVOX_SDK_ROOT}")
+message(STATUS "Livox SDK library: ${LIVOX_LIDAR_SDK_LIBRARY}")
+message(STATUS "Livox SDK include: ${LIVOX_LIDAR_SDK_INCLUDE_DIR}")
 
 ## PCL library
 link_directories(${PCL_LIBRARY_DIRS})
@@ -95,7 +114,9 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/call_back/livox_lidar_callback.cpp
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${livox_sdk_INCLUDE_DIRS})
+target_include_directories(${PROJECT_NAME} PRIVATE
+  ${LIVOX_LIDAR_SDK_INCLUDE_DIR}
+)
 
 # get include directories of custom msg headers
 
